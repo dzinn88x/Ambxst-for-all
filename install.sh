@@ -7,6 +7,43 @@ INSTALL_PATH="$HOME/.local/src/ambxst"
 BIN_DIR="/usr/local/bin"
 QUICKSHELL_REPO="https://git.outfoxxed.me/outfoxxed/quickshell"
 
+# === Offline mode ===
+# ./install.sh --offline (or AMBXST_OFFLINE=1) never touches the network: no
+# git clone/fetch, no release/binary/icon/axctl download, no package manager,
+# no Quickshell build. It builds the backend from the local checkout with the
+# vendored Go modules and only verifies that the system dependencies are
+# already present (it reports what is missing instead of installing it).
+OFFLINE="${AMBXST_OFFLINE:-0}"
+_args=()
+for _a in "$@"; do
+  case "$_a" in
+  --offline) OFFLINE=1 ;;
+  *) _args+=("$_a") ;;
+  esac
+done
+set -- "${_args[@]}"
+[[ "$OFFLINE" == "1" ]] && AMBXST_SKIP_AXCTL=1
+
+# === Local source detection ===
+# When this script is run from a checkout (./install.sh), install THAT code:
+# no clone, no `git reset --hard`, no upstream binary; the backend is built
+# from the checkout. Piped runs (curl ... | bash) have no script path and keep
+# using GitHub. Override with AMBXST_LOCAL=1 (force local) or AMBXST_LOCAL=0.
+LOCAL_SRC=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$_script_dir/shell.qml" && -f "$_script_dir/backend/go.mod" ]]; then
+    LOCAL_SRC="$_script_dir"
+  fi
+fi
+[[ "${AMBXST_LOCAL:-}" == "0" ]] && LOCAL_SRC=""
+[[ "$OFFLINE" == "1" ]] && AMBXST_LOCAL=1
+if [[ "${AMBXST_LOCAL:-}" == "1" && -z "$LOCAL_SRC" ]]; then
+  echo "AMBXST_LOCAL=1 but install.sh is not inside an Ambxst checkout" >&2
+  exit 1
+fi
+[[ -n "$LOCAL_SRC" ]] && INSTALL_PATH="$LOCAL_SRC"
+
 # === Helpers ===
 GREEN='\033[0;32m' BLUE='\033[0;34m' YELLOW='\033[1;33m' RED='\033[0;31m' NC='\033[0m'
 log_info() { echo -e "${BLUE}ℹ  $1${NC}" >&2; }
@@ -85,8 +122,57 @@ filter_packages() {
   echo "${needed[@]}"
 }
 
+# === Offline dependency check ===
+# Installs nothing. Hard requirements abort; the rest only warn.
+check_offline_dependencies() {
+  log_info "Offline mode: checking installed dependencies (nothing will be downloaded)"
+
+  local missing_hard=() missing_soft=() cmd
+  for cmd in qs go; do
+    has_cmd "$cmd" || missing_hard+=("$cmd")
+  done
+  for cmd in matugen jq tmux fuzzel playerctl brightnessctl nmcli; do
+    has_cmd "$cmd" || missing_soft+=("$cmd")
+  done
+
+  has_font "Phosphor" || missing_soft+=("Phosphor icon font")
+
+  if [[ ${#missing_soft[@]} -gt 0 ]]; then
+    log_warn "Not installed (some features will be limited): ${missing_soft[*]}"
+  fi
+  if [[ ${#missing_hard[@]} -gt 0 ]]; then
+    log_error "Required but not installed: ${missing_hard[*]}"
+    log_warn "Install them with your package manager and run ./install.sh --offline again."
+    exit 1
+  fi
+  log_success "Required dependencies present"
+}
+
+# Installs Phosphor fonts from a local folder (offline/fonts/*.ttf inside the
+# checkout, or $AMBXST_FONTS_DIR) when the font is missing. Never downloads.
+install_local_fonts() {
+  has_font "Phosphor" && return
+  local SRC="${AMBXST_FONTS_DIR:-$LOCAL_SRC/offline/fonts}"
+  compgen -G "$SRC/*.ttf" >/dev/null || return 0
+  local FONT_DIR="$HOME/.local/share/fonts/phosphor"
+  mkdir -p "$FONT_DIR"
+  cp "$SRC"/*.ttf "$FONT_DIR/"
+  has_cmd fc-cache && fc-cache -f "$FONT_DIR"
+  log_success "Phosphor fonts installed from $SRC"
+}
+
 # === Dependency Installation ===
 install_dependencies() {
+  if [[ "$OFFLINE" == "1" ]]; then
+    if [[ "$DISTRO" == "nixos" ]]; then
+      log_error "Offline mode is not supported on NixOS (the flake is fetched from GitHub). Build from the checkout with nix instead."
+      exit 1
+    fi
+    check_offline_dependencies
+    install_local_fonts
+    return
+  fi
+
   case "$DISTRO" in
   nixos)
     local FLAKE_URI="${1:-github:Axenide/Ambxst}"
@@ -284,6 +370,11 @@ migrate_old_paths() {
 setup_repo() {
   [[ "$DISTRO" == "nixos" ]] && return
 
+  if [[ -n "$LOCAL_SRC" ]]; then
+    log_info "Using local source at $LOCAL_SRC (no clone, no update)"
+    return
+  fi
+
   if [[ ! -d "$INSTALL_PATH" ]]; then
     log_info "Cloning Ambxst to $INSTALL_PATH..."
     mkdir -p "$(dirname "$INSTALL_PATH")"
@@ -343,8 +434,40 @@ setup_repo() {
 }
 
 # === Binary Download ===
+# Builds the backend from the local checkout into /tmp/ambxst, the same place
+# download_binary leaves the upstream release binary.
+build_local_binary() {
+  has_cmd go || {
+    log_error "Go is required to build from local source (backend/go.mod). Install Go, or run with AMBXST_LOCAL=0 to use the upstream release."
+    exit 1
+  }
+  log_info "Building Ambxst backend from $LOCAL_SRC/backend..."
+  local FLAGS=()
+  if [[ "$OFFLINE" == "1" ]]; then
+    [[ -d "$LOCAL_SRC/backend/vendor" ]] || {
+      log_error "backend/vendor is missing: offline builds need the vendored Go modules."
+      exit 1
+    }
+    # No module/toolchain downloads: the installed Go must satisfy go.mod.
+    export GOFLAGS="-mod=vendor" GOPROXY=off GOTOOLCHAIN=local
+  elif [[ -d "$LOCAL_SRC/backend/vendor" ]]; then
+    FLAGS+=("-mod=vendor")
+  fi
+  (cd "$LOCAL_SRC/backend" && go build "${FLAGS[@]}" -o /tmp/ambxst ./cmd/ambxst) || {
+    log_error "Local build failed."
+    [[ "$OFFLINE" == "1" ]] && log_warn "Offline builds need Go >= the version in backend/go.mod (no toolchain download)."
+    exit 1
+  }
+  log_success "Backend built from local source"
+}
+
 download_binary() {
   [[ "$DISTRO" == "nixos" ]] && return
+
+  if [[ -n "$LOCAL_SRC" ]]; then
+    build_local_binary
+    return
+  fi
 
   local ARCH
   case "$(uname -m)" in
@@ -387,6 +510,7 @@ download_binary() {
 
 # === Quickshell Build ===
 install_quickshell() {
+  [[ "$OFFLINE" == "1" ]] && return
   [[ "$DISTRO" == "nixos" || "$DISTRO" == "fedora" || "$DISTRO" == "arch" ]] && return
   has_cmd qs && {
     log_info "Quickshell already installed"
@@ -413,24 +537,39 @@ install_axctl() {
     return
   fi
 
+  # axctl only drives Hyprland, Niri and Mango. Everywhere else Ambxst runs in
+  # generic mode (standard Wayland protocols), so axctl is optional and a
+  # failure here must not abort the install.
+  if [[ "${AMBXST_SKIP_AXCTL:-0}" == "1" ]]; then
+    if [[ "$OFFLINE" == "1" ]]; then
+      log_info "Offline mode: skipping axctl (install it yourself if you use Hyprland/Niri/Mango)"
+    else
+      log_info "Skipping axctl (AMBXST_SKIP_AXCTL=1): Ambxst will run in generic Wayland mode"
+    fi
+    return
+  fi
+
   log_info "Installing axctl..."
   local installer
   installer="$(mktemp)"
   if ! curl -fsSL --retry 3 -o "$installer" get.axeni.de/axctl; then
     rm -f "$installer"
-    log_error "Failed to download axctl installer"
-    exit 1
+    log_warn "Failed to download axctl installer; continuing in generic Wayland mode (no compositor-specific features)"
+    return
   fi
 
   if [[ "$(head -c 2 "$installer")" != "#!" ]]; then
     rm -f "$installer"
-    log_error "Downloaded axctl installer is not a valid script"
-    exit 1
+    log_warn "Downloaded axctl installer is not a valid script; continuing in generic Wayland mode"
+    return
   fi
 
-  sh "$installer"
+  if sh "$installer"; then
+    log_success "axctl installed"
+  else
+    log_warn "axctl installer failed; continuing in generic Wayland mode"
+  fi
   rm -f "$installer"
-  log_success "axctl installed"
 }
 
 # === Service Configuration ===
@@ -520,3 +659,4 @@ setup_launcher
 echo ""
 log_success "Installation complete!"
 [[ "$DISTRO" != "nixos" ]] && echo -e "Run ${GREEN}ambxst${NC} to start."
+echo -e "Not on Hyprland, Niri or Mango? Run ${GREEN}ambxst install generic${NC} for autostart and keybind snippets."
